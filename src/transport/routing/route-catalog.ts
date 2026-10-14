@@ -18,6 +18,7 @@ import {
 import "../../providers/integrations/claude/claude-oauth";
 import "../../providers/integrations/codex/codex-oauth";
 import { resolveTenantOverride } from "../../persistence/tenant-scope";
+import { resolveRouteMaxAttempts } from "../../config";
 import {
   DEFAULT_PROVIDER_USER_AGENT,
   type RouteCandidate,
@@ -522,7 +523,36 @@ class RouteCatalogRepository {
                 ...(tenantPools.routing ? { network_pool_routing: tenantPools.routing } : {}),
               };
               if (tenantId === undefined || tenantId === tId) {
-                candidates.push(tenantCandidate);
+                // One candidate carries one pool SET, and dispatch picks a
+                // single pool inside it (`tryAcquireAvailablePool`). Emitting
+                // this tenant's pools once therefore gives the attempt loop a
+                // single pooled attempt, and the next candidate is the global
+                // fallback below — the gateway's own egress, which is exactly
+                // the address the provider just refused for an
+                // `ipScopedRateLimit` provider. A pool 429 was thus
+                // unretryable: one pooled try, then a hopeless direct one.
+                //
+                // Repeat the candidate so the loop has pooled attempts to
+                // walk. It does not re-dial the same pool: the failed attempt
+                // benched that pool (`flagPoolCooldown`) and the selector skips
+                // cooling pools while advancing its rotation cursor, so
+                // consecutive attempts leave by different pools. The global
+                // fallback stays LAST, so direct egress remains the final
+                // resort rather than the second attempt. One pool is emitted
+                // once — repeating it would buy nothing.
+                //
+                // The same object is pushed rather than copies because
+                // `plan()`'s provider rotation (`reorderRun`) locates its pick
+                // with `indexOf`: a shared identity keeps the pooled group
+                // ahead of the fallback instead of rotating the fallback to the
+                // front and re-dialing the refused address first.
+                const pooledAttempts = Math.max(
+                  1,
+                  Math.min(tenantPools.ids.length, resolveRouteMaxAttempts() - 1),
+                );
+                for (let attempt = 0; attempt < pooledAttempts; attempt += 1) {
+                  candidates.push(tenantCandidate);
+                }
               }
             }
           }
